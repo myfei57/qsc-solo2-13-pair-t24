@@ -338,12 +338,23 @@ class ConsoleServer:
         host, port = self._httpd.server_address[:2]
         return str(host), int(port)
 
+    def bind(self) -> tuple[str, int]:
+        """只创建并绑定 HTTP 服务、不起服务线程；返回实际监听地址。"""
+
+        if self._httpd is None:
+            handler = _build_handler(self.console)
+            self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
+            self._httpd.daemon_threads = True
+        return self.address
+
     def start(self) -> tuple[str, int]:
-        handler = _build_handler(self.console)
-        self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
-        self._httpd.daemon_threads = True
-        self._thread = threading.Thread(target=self._httpd.serve_forever, name="flashsmelter-console", daemon=True)
-        self._thread.start()
+        self.bind()
+        assert self._httpd is not None
+        if self._thread is None:
+            self._thread = threading.Thread(
+                target=self._httpd.serve_forever, name="flashsmelter-console", daemon=True
+            )
+            self._thread.start()
         return self.address
 
     def serve_forever(self) -> None:

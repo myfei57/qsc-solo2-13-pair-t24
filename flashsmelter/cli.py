@@ -18,6 +18,7 @@ from .config import Settings
 from .console import ConsoleApp, ConsoleServer
 from .errors import FlashSmelterError, ValidationError
 from .params import Params
+from .preflight import report_from_boot_error, run_preflight
 
 
 def _coerce(text: str) -> Any:
@@ -79,13 +80,56 @@ def _run(action: str, params: Mapping[str, Any], args: argparse.Namespace) -> in
     return 0
 
 
-def _cmd_serve(args: argparse.Namespace) -> int:
+def _resolve_listen_settings(args: argparse.Namespace) -> Settings:
+    """合并根/命名空间/监听参数，得到 serve 与 doctor 共用的最终配置。"""
+
     settings = replace(_build_settings(args), host=args.host, port=args.port)
     settings.validate()
+    return settings
+
+
+def _preflight(settings: Settings, *, as_json: bool) -> int | None:
+    """跑启动自检；未通过时打印报告并返回退出码，通过返回 None。"""
+
+    report = run_preflight(settings, host=settings.host, port=settings.port)
+    if as_json:
+        _print(report.to_dict())
+    else:
+        print(report.render_text(), flush=True)
+    if not report.ok:
+        return 3
+    return None
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    try:
+        settings = _resolve_listen_settings(args)
+    except FlashSmelterError as exc:
+        if args.skip_preflight:
+            raise
+        print(report_from_boot_error(exc).render_text(), file=sys.stderr, flush=True)
+        return 3
+    if not args.skip_preflight:
+        failed = _preflight(settings, as_json=False)
+        if failed is not None:
+            return failed
+    else:
+        print("已按 --skip-preflight 跳过启动自检（不建议），直接启动。", flush=True)
     application = Application(settings)
     console = ConsoleApp(application)
     server = ConsoleServer(console, host=settings.host, port=settings.port)
-    host, port = server.start()
+
+    # 先绑定端口再宣布启动；绑定失败（自检之后被人抢端口等）给出一致的改法提示。
+    try:
+        host, port = server.bind()
+    except OSError as exc:
+        print(
+            f"控制台绑定 {settings.host}:{settings.port} 失败：{exc.strerror or exc}。"
+            "可先运行 `flashsmelter doctor` 定位问题。",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 3
     print(f"FlashSmelter 控制台已启动：http://{host}:{port}/api/state（Ctrl+C 停止）", flush=True)
     try:
         server.serve_forever()
@@ -151,6 +195,20 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0 if report.get("ok") else 2
 
 
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    try:
+        settings = _resolve_listen_settings(args)
+    except FlashSmelterError as exc:
+        report = report_from_boot_error(exc)
+    else:
+        report = run_preflight(settings, host=settings.host, port=settings.port)
+    if args.json:
+        _print(report.to_dict())
+    else:
+        print(report.render_text(), flush=True)
+    return 3 if not report.ok else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="flashsmelter",
@@ -161,9 +219,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="store_true", help="打印版本后退出")
     subparsers = parser.add_subparsers(dest="command")
 
-    serve = subparsers.add_parser("serve", help="启动 JSON 控制台")
+    serve = subparsers.add_parser("serve", help="启动 JSON 控制台（启动前自动自检）")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
+    serve.add_argument("--skip-preflight", action="store_true", help="跳过启动自检（不建议）")
     serve.set_defaults(func=_cmd_serve)
 
     status = subparsers.add_parser("status", help="打印平台状态")
@@ -194,6 +253,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify = subparsers.add_parser("verify", help="校验落盘数据完整性")
     verify.set_defaults(func=_cmd_verify)
+
+    doctor = subparsers.add_parser("doctor", help="启动前自检：配置、数据目录、端口、依赖")
+    doctor.add_argument("--host", default="127.0.0.1", help="拟监听地址，与 serve 保持一致")
+    doctor.add_argument("--port", type=int, default=8080, help="拟监听端口，与 serve 保持一致")
+    doctor.add_argument("--json", action="store_true", help="输出 JSON 报告（默认输出可读文本）")
+    doctor.set_defaults(func=_cmd_doctor)
 
     return parser
 
