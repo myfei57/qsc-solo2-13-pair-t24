@@ -18,6 +18,7 @@ from .config import Settings
 from .console import ConsoleApp, ConsoleServer
 from .errors import FlashSmelterError, ValidationError
 from .params import Params
+from .preflight import Preflight, render_text
 
 
 def _coerce(text: str) -> Any:
@@ -64,6 +65,18 @@ def _build_settings(args: argparse.Namespace) -> Settings:
     return settings
 
 
+def _load_settings(args: argparse.Namespace, *, host: str | None = None, port: int | None = None):
+    """供自检与 serve 使用的宽容装载：配置再坏也不抛异常，交给自检报全。"""
+
+    return Settings.load(
+        None,
+        root=getattr(args, "root", None),
+        namespace=getattr(args, "namespace", None),
+        host=host,
+        port=port,
+    )
+
+
 def _print(payload: Any) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
@@ -80,12 +93,29 @@ def _run(action: str, params: Mapping[str, Any], args: argparse.Namespace) -> in
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
-    settings = replace(_build_settings(args), host=args.host, port=args.port)
-    settings.validate()
+    # 起来就干、撞了再说的事故不能再出：绑定端口前先把自检全过一遍，
+    # 任何一项未通过都不放行，问题与修改建议一次打全。
+    settings, config_issues = _load_settings(args, host=args.host, port=args.port)
+    preflight = Preflight(settings, config_issues=config_issues)
+    report = preflight.run()
+    if not report.ok:
+        print(render_text(report), flush=True)
+        preflight.release()
+        return 3
     application = Application(settings)
     console = ConsoleApp(application)
     server = ConsoleServer(console, host=settings.host, port=settings.port)
-    host, port = server.start()
+    try:
+        host, port = server.start()
+    except OSError as exc:
+        # 自检与真正绑定之间仍有极小竞态窗口：再兜一层，不打原始堆栈。
+        print(
+            f"[FAIL] 监听端口 —— {settings.host}:{settings.port} 绑定失败："
+            f"{exc.strerror or exc}。请按 doctor 的「修改」建议处理后重试",
+            flush=True,
+        )
+        preflight.release()
+        return 3
     print(f"FlashSmelter 控制台已启动：http://{host}:{port}/api/state（Ctrl+C 停止）", flush=True)
     try:
         server.serve_forever()
@@ -93,7 +123,22 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         pass
     finally:
         server.stop()
+        preflight.release()
     return 0
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """启动前自检：配置/命名空间/数据目录/端口/依赖/单实例，不过不放行。"""
+
+    settings, config_issues = _load_settings(args)
+    preflight = Preflight(settings, config_issues=config_issues)
+    report = preflight.run()
+    if args.json:
+        _print(report.to_dict())
+    else:
+        print(render_text(report), flush=True)
+    preflight.release()
+    return 0 if report.ok else 3
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -161,9 +206,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="store_true", help="打印版本后退出")
     subparsers = parser.add_subparsers(dest="command")
 
-    serve = subparsers.add_parser("serve", help="启动 JSON 控制台")
-    serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=8080)
+    serve = subparsers.add_parser("serve", help="启动前自检通过后启动 JSON 控制台")
+    serve.add_argument("--host", default=None, help="监听地址（默认 127.0.0.1，可用 FLASHSMELTER_HOST）")
+    serve.add_argument("--port", type=int, default=None, help="监听端口（默认 8080，可用 FLASHSMELTER_PORT）")
     serve.set_defaults(func=_cmd_serve)
 
     status = subparsers.add_parser("status", help="打印平台状态")
@@ -194,6 +239,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify = subparsers.add_parser("verify", help="校验落盘数据完整性")
     verify.set_defaults(func=_cmd_verify)
+
+    doctor = subparsers.add_parser("doctor", help="启动前自检：配置、数据目录、端口、依赖、单实例逐项过")
+    doctor.add_argument("--json", action="store_true", help="以 JSON 输出自检结果")
+    doctor.set_defaults(func=_cmd_doctor)
 
     return parser
 

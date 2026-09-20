@@ -347,7 +347,8 @@ class ConsoleServer:
         return self.address
 
     def serve_forever(self) -> None:
-        self.start()
+        if self._httpd is None:
+            self.start()
         assert self._httpd is not None
         try:
             while True:
